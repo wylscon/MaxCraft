@@ -84,7 +84,7 @@ namespace
     // there take the weapon camera's projection and are not occluded by the level. The world scene is
     // the frame's busiest perspective scene, measured on the previous frame (the layout does not change
     // from one frame to the next), and the in-scene moments only draw inside it.
-    constexpr int  kMaxScenes = 8;
+    constexpr int  kMaxScenes = 64;
     int            g_sceneIndex = -1;                 // this frame's current scene, from 0
     UINT           g_sceneDraws[kMaxScenes]{};        // this frame: world draws per perspective scene
     int            g_worldScene = -1;                 // previous frame's busiest scene; -1 = unknown
