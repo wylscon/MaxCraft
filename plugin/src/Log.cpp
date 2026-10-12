@@ -109,6 +109,7 @@ void mclog::WriteRaw(const char* line)
         out[at++] = static_cast<char>('0' + value / 10);
         out[at++] = static_cast<char>('0' + value % 10);
     };
+    out[at++] = '[';
     two(t.wHour);
     out[at++] = ':';
     two(t.wMinute);

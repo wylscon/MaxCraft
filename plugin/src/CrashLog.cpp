@@ -149,6 +149,47 @@ namespace
         return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
     }
 
+    // MP2's own startup crash, maxpayne2.exe+0x1b80, made survivable.
+    //
+    // 0x401b70 is MP2's low-level keyboard hook (a HOOKPROC: stdcall, three arguments, it reads a
+    // KBDLLHOOKSTRUCT and checks Esc, the Windows key and Alt). Its first lines are
+    //     push esi / push edi / call <app> / mov eax,[eax+4] / mov ecx,[eax+0xf2] / mov eax,[ecx]
+    // and the last load faults when a key event (seen: WM_SYSKEYDOWN) arrives before MP2 has created
+    // the object at +0xf2. That is a race in MP2, not in this mod, and it ends the game at the menu.
+    //
+    // At the fault the two pushes are the only thing on the stack above the return address, so the
+    // hook can be left exactly as `ret 0Ch` would leave it, returning 0 - "not handled, let the key
+    // through", which is what the hook does anyway for keys it does not care about. Matched on the
+    // exact address, the exact instruction bytes and ecx == 0, so nothing else can take this path.
+    bool SkipEarlyKeyboardHook(EXCEPTION_POINTERS* info)
+    {
+        CONTEXT* c = info->ContextRecord;
+        static const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        if (!exe || c->Ecx != 0 || c->Eip != exe + 0x1b80)
+            return false;
+        static constexpr std::uint8_t kEntry[] = { 0x56, 0x57, 0xe8 };                    // at +0x1b70
+        static constexpr std::uint8_t kFault[] = { 0x8b, 0x01, 0xff, 0x50, 0x34 };        // at +0x1b80
+        const auto* code = reinterpret_cast<const std::uint8_t*>(exe);
+        for (std::size_t i = 0; i < sizeof(kEntry); ++i)
+            if (code[0x1b70 + i] != kEntry[i])
+                return false;
+        for (std::size_t i = 0; i < sizeof(kFault); ++i)
+            if (code[0x1b80 + i] != kFault[i])
+                return false;
+
+        const auto* stack = reinterpret_cast<const DWORD*>(c->Esp);
+        c->Edi = stack[0];
+        c->Esi = stack[1];
+        c->Eip = stack[2];
+        c->Esp += 3 * 4 + 3 * 4;  // the two pushes and the return address, then ret 0Ch's arguments
+        c->Eax = 0;
+
+        static std::atomic<int> said{ 0 };
+        if (said.fetch_add(1) == 0)
+            mclog::WriteRaw("startup: MP2's keyboard hook (maxpayne2.exe+0x1b80) ran before the game was ready; the key was passed through instead of crashing");
+        return true;
+    }
+
     LONG CALLBACK Handler(EXCEPTION_POINTERS* info)
     {
         // Deliberately narrow. Guarded() in Hook.h provokes access violations on purpose on engine
@@ -165,6 +206,8 @@ namespace
         const CONTEXT* c = info->ContextRecord;
         if (!c)
             return EXCEPTION_CONTINUE_SEARCH;
+        if (code == EXCEPTION_ACCESS_VIOLATION && SkipEarlyKeyboardHook(info))
+            return EXCEPTION_CONTINUE_EXECUTION;
 
         // §13: a fault *inside* this handler must not start a second copy of it. Without this the
         // handler is re-entered on the same stack, its own frames push the stack further into whatever
