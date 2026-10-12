@@ -352,7 +352,13 @@ namespace
         // to Minecraft's controls would be the one key that cannot be pressed. Not while a Minecraft
         // screen is open, so typing the key's character into chat does not switch.
         if (dik == static_cast<std::uint32_t>(cfg.gameControlsKey) && !State().mcScreenOpen) {
-            if (down) {
+            // MP2 reads the keyboard both polled and buffered, and the two disagree for a moment about
+            // a held key (the buffer replays the press and release while the poll still says down),
+            // so one press can arrive here as many down edges. Without this the toggle flipped
+            // hundreds of times per press and landed anywhere.
+            static ULONGLONG lastToggle = 0;
+            if (down && GetTickCount64() - lastToggle > 400) {
+                lastToggle = GetTickCount64();
                 const bool on = !State().gameControls.load();
                 State().gameControls = on;
                 input::ReleaseAll();
