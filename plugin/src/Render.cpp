@@ -78,6 +78,19 @@ namespace
     UINT           g_drawsSinceClear = 0;
     UINT           g_drawnAtClear = 0, g_drawnAtEndScene = 0, g_drawnAtPresent = 0;
     EndSceneFn     g_origEndScene = nullptr;
+    // Which BeginScene/EndScene pair of the frame is the WORLD scene. MP2 draws its weapon in a
+    // perspective scene of its own, with the weapon's projection and a depth buffer that holds only the
+    // weapon; "the first perspective scene that reached EndScene" could be that one, and blocks drawn
+    // there take the weapon camera's projection and are not occluded by the level. The world scene is
+    // the frame's busiest perspective scene, measured on the previous frame (the layout does not change
+    // from one frame to the next), and the in-scene moments only draw inside it.
+    constexpr int  kMaxScenes = 8;
+    int            g_sceneIndex = -1;                 // this frame's current scene, from 0
+    UINT           g_sceneDraws[kMaxScenes]{};        // this frame: world draws per perspective scene
+    int            g_worldScene = -1;                 // previous frame's busiest scene; -1 = unknown
+    UINT           g_lastSceneDraws[kMaxScenes]{};    // previous frame, for the log
+    int            g_lastSceneCount = 0;
+    bool InWorldScene() { return g_worldScene < 0 || g_sceneIndex == g_worldScene; }
 
     // MP2's world projection, as it last set it. The blocks are drawn into the same picture, so
     // they take the projection MP2's geometry was drawn with (SceneProjection picks it out of the
@@ -1144,6 +1157,8 @@ namespace
         // A fresh BeginScene is exactly the boundary MP2 sets its projection after.
         g_frameProjCount = 0;
         g_frameSceneDraws = 0;
+        if (!g_ownDraw && g_sceneIndex + 1 < kMaxScenes)
+            ++g_sceneIndex;
         ResetSceneTransformState();
         diag::Mark(diag::kBeginSceneExit);
         return g_origBeginScene(device);
@@ -1191,8 +1206,10 @@ namespace
     HRESULT __stdcall EndSceneHook(void* device)
     {
         diag::Mark(diag::kEndSceneEnter);
+        if (!g_ownDraw && g_sceneIndex >= 0 && g_sceneHadPerspective)
+            g_sceneDraws[g_sceneIndex] = g_frameSceneDraws;
         const BlocksMode mode = BlocksDrawMode();
-        if (UsesWorldScene(mode) && g_sceneHadPerspective && !g_depthClearedThisScene && ReadyForBlocks()) {
+        if (UsesWorldScene(mode) && g_sceneHadPerspective && !g_depthClearedThisScene && InWorldScene() && ReadyForBlocks()) {
             if (DrawWorldInScene(device)) {
                 g_blocksDrawnThisFrame = true;
                 ++g_drawnAtEndScene;
@@ -1217,7 +1234,7 @@ namespace
                 g_depthClearedThisScene = true;
             g_drawsSinceClear = 0;
         }
-        if ((flags & kClearZBuffer) && UsesWeaponClear(BlocksDrawMode()) && ReadyForBlocks()) {
+        if ((flags & kClearZBuffer) && UsesWeaponClear(BlocksDrawMode()) && InWorldScene() && ReadyForBlocks()) {
             if (DrawWorldInScene(device)) {
                 g_blocksDrawnThisFrame = true;
                 ++g_drawnAtClear;
@@ -1251,6 +1268,8 @@ namespace
             g_drawsSinceClear = 0;
             g_depthClearedThisScene = false;
             g_sceneHadPerspective = false;
+            g_sceneIndex = -1;
+            g_worldScene = -1;
             g_device = device;
         }
         // The shared mapping and the Minecraft start-up both used to be right here, which made them depend
@@ -1412,7 +1431,23 @@ namespace
             g_viewSets = g_viewReplaced = g_worldCorrected = g_trianglesDrawn = g_constantsMoved = g_drawFailures = 0;
             g_drawnAtClear = g_drawnAtEndScene = g_drawnAtPresent = g_entityTrianglesDrawn = 0;
             g_rejectedMessages = g_renderBacklog = g_noCamera = 0;
+            std::string layout;
+            for (int i = 0; i < g_lastSceneCount; ++i)
+                layout += std::format("{}{}", i ? " " : "", g_lastSceneDraws[i]);
+            mclog::Info("render: scenes last frame: {} (world draws each: {}); blocks go in scene #{}", g_lastSceneCount, layout.empty() ? "-" : layout,
+                        g_worldScene);
         }
+        // The frame's busiest perspective scene is the world; the next frame's blocks go into it.
+        g_lastSceneCount = (std::min)(g_sceneIndex + 1, kMaxScenes);
+        int busiest = -1;
+        for (int i = 0; i < g_lastSceneCount; ++i) {
+            g_lastSceneDraws[i] = g_sceneDraws[i];
+            if (g_sceneDraws[i] >= 8 && (busiest < 0 || g_sceneDraws[i] > g_sceneDraws[busiest]))
+                busiest = i;
+            g_sceneDraws[i] = 0;
+        }
+        g_worldScene = busiest;
+        g_sceneIndex = -1;
         // The per-frame flags are cleared here, at the one point every frame reaches whether or not
         // anything was drawn: the w/h, mcInWorld and BeginScene branches above all fall through to
         // this, so a frame with no back buffer yet cannot leave the next one thinking it drew blocks.
