@@ -91,7 +91,8 @@ const Config& Config::Get()
         c.bulletTimeKey = ReadInt(ini, L"Controls", L"iBulletTimeKey", c.bulletTimeKey);
         c.quickSaveKey = ReadInt(ini, L"Controls", L"iQuickSaveKey", c.quickSaveKey);
         c.weaponModeKey = ReadInt(ini, L"Controls", L"iWeaponModeKey", c.weaponModeKey);
-        c.useKey = ReadInt(ini, L"Controls", L"iUseKey", c.useKey);
+        c.inventoryKey = ReadInt(ini, L"Controls", L"iInventoryKey", c.inventoryKey);
+        c.gameControlsKey = ReadInt(ini, L"Controls", L"iGameControlsKey", c.gameControlsKey);
 
         c.diagnostics = ReadInt(ini, L"Debug", L"bDiagnostics", 0) != 0;
         c.blocksNoDepth = ReadInt(ini, L"Debug", L"bBlocksNoDepth", 0) != 0;

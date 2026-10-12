@@ -468,10 +468,11 @@ namespace
         // outside its walls, not Minecraft. Undo it rather than handing him to MP2's death sequence.
         if (dead && !cinematic && st.minecraftOwnsPlayer && !(st.haveMc && (st.mc.flags & proto::kMcDead)) && ReviveMax(player))
             dead = false;
-        const bool takeover = cinematic || camera::PathActive() || dead;
+        const bool chosen = st.gameControls.load(std::memory_order_relaxed);  // the player switched to MP2's own controls
+        const bool takeover = cinematic || camera::PathActive() || dead || chosen;
         if (takeover != g_takeover) {
             if (takeover)
-                mclog::Info("MP2 takes Max ({})", cinematic ? "cut-scene" : dead ? "dead" : "camera path");
+                mclog::Info("MP2 takes Max ({})", cinematic ? "cut-scene" : dead ? "dead" : chosen ? "the player chose MP2's controls" : "camera path");
             else
                 mclog::Info("MP2 hands Max back");
             if (!takeover)

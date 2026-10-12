@@ -34,6 +34,11 @@ struct Runtime
     std::atomic<int> viewportW{ 1280 };
     std::atomic<int> viewportH{ 720 };
 
+    // The player switched to MP2's own controls (Config::gameControlsKey): Minecraft lets go of Max
+    // and MP2 plays as it would without the mod, until the key is pressed again. Set by the input
+    // thread, read by the game thread.
+    std::atomic<bool> gameControls{ false };
+
     // Latest Minecraft state (game thread) and the camera built from it this frame.
     proto::McState mc{};
     bool           haveMc{ false };

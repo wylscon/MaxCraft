@@ -56,7 +56,8 @@ Bunların dışında **her tuş Minecraft'a gider**, E (envanter) ve F5 (kamera)
 Ayar dosyasındaki tuşlar:
 
 - `iQuickSaveKey` (varsayılan F6) → MP2'ye F5 olarak iletilir
-- `iUseKey` (varsayılan G) → MP2'ye E olarak iletilir
+- `iInventoryKey` (varsayılan G) → Minecraft'a E (envanter) olarak iletilir; E MP2'nin eylem tuşudur
+- `iGameControlsKey` (varsayılan F8) → MP2'nin kendi kontrollerine geçer / geri döner
 - `iBulletTimeKey` (varsayılan B) → MP2'nin sağ fare tuşu olarak iletilir
 - `iWeaponModeKey` (varsayılan V) → silah modu anahtarı
 

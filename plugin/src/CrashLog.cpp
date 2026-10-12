@@ -170,9 +170,12 @@ namespace
         static constexpr std::uint8_t kEntry[] = { 0x56, 0x57, 0xe8 };                    // at +0x1b70
         static constexpr std::uint8_t kFault[] = { 0x8b, 0x01, 0xff, 0x50, 0x34 };        // at +0x1b80
         const auto* code = reinterpret_cast<const std::uint8_t*>(exe);
-        for (std::size_t i = 0; i < sizeof(kEntry); ++i)
-            if (code[0x1b70 + i] != kEntry[i])
-                return false;
+        // 0xe9 is Input.cpp's detour (Win key passthrough) sitting on the entry: the pushes then run
+        // in MinHook's trampoline, so the stack at the fault is the same either way.
+        if (code[0x1b70] != 0xe9)
+            for (std::size_t i = 0; i < sizeof(kEntry); ++i)
+                if (code[0x1b70 + i] != kEntry[i])
+                    return false;
         for (std::size_t i = 0; i < sizeof(kFault); ++i)
             if (code[0x1b80 + i] != kFault[i])
                 return false;
