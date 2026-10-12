@@ -101,6 +101,8 @@ const Config& Config::Get()
         c.noWvpFixup = ReadInt(ini, L"Debug", L"bNoWvpFixup", 0) != 0;
         c.noBlockDraw = ReadInt(ini, L"Debug", L"bNoBlockDraw", 0) != 0;
         c.noRenderHooks = ReadInt(ini, L"Debug", L"bNoRenderHooks", 0) != 0;
+        c.disabledHooks = Read(ini, L"Debug", L"sDisabledHooks", L"");
+        c.noVtableSelfCheck = ReadInt(ini, L"Debug", L"bNoVtableSelfCheck", 0) != 0;
         return c;
     }();
     return config;

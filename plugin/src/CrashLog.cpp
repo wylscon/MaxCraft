@@ -1,5 +1,7 @@
 #include "CrashLog.h"
 
+#include "Config.h"
+#include "Diag.h"
 #include "Log.h"
 
 #include <Windows.h>
@@ -7,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 
 namespace
 {
@@ -163,6 +166,21 @@ namespace
         if (!c)
             return EXCEPTION_CONTINUE_SEARCH;
 
+        // §13: a fault *inside* this handler must not start a second copy of it. Without this the
+        // handler is re-entered on the same stack, its own frames push the stack further into whatever
+        // ran out, and the game dies with no report at all - which is a shape we cannot distinguish
+        // from "the handler never ran". One line and out.
+        static std::atomic<bool> g_inHandler{ false };
+        bool                    expected = false;
+        if (!g_inHandler.compare_exchange_strong(expected, true)) {
+            mclog::WriteRaw("CRASH REENTRY: a second fault inside the crash handler; this report is incomplete");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        struct HandlerScope
+        {
+            ~HandlerScope() { g_inHandler.store(false); }
+        } scope;
+
         const int seen = g_logged.fetch_add(1);
         if (seen >= kMaxReports) {
             // Say it once, or the tail of a crashy session just stops and reads like a log that lost
@@ -173,6 +191,15 @@ namespace
         }
 
         Reporter r;
+        // §12: one short line to disk BEFORE anything that can fail. Everything after this point calls
+        // into module lookups, GetModuleFileNameW and the loader lock, any of which can be the thing
+        // that faults; if one of them is, the log ends with nothing and the run looks like a crash the
+        // handler never saw. WriteRaw is a single WriteFile on its own handle with no lock and no CRT
+        // (see mclog::WriteRaw), so this line costs one syscall and cannot itself block.
+        r.Text("CRASH ");
+        r.Hex(code, 1, true);
+        r.Line();
+
         r.Text("EXCEPTION ");
         r.Hex(code, 1, true);
         r.Text(" at ");
@@ -303,6 +330,63 @@ namespace
         r.Text(" ");
         r.Hex(frame[3], 8);
         r.Line();
+        // ---- what the render path was doing (§15, §16, §40) --------------------------------------
+        //
+        // This is the part that was missing when this search started. The run that ruled the WVP fixup
+        // out wrote no exception line at all, and even when it does, a report full of registers says
+        // nothing about which of the eight hooks was in play - the faulting thread was inside
+        // maxpayne2.exe, several calls below whatever of ours was running. The ring holds the last
+        // things the render path entered or left, so the report can name the callback.
+        {
+            const diag::Record last = diag::Last();
+            r.Text("  LAST HOOK: ");
+            r.Text(diag::Name(last.event));
+            r.Text("  thread ");
+            r.Dec(last.threadId);
+            r.Line();
+
+            // Oldest first, so the report reads forwards, and each line carries its sequence number: the
+            // window is the tail of a ring, and a reader who wants to know whether a record was
+            // skipped (its slot was being written when the fault came) can see it in the numbering.
+            diag::Record ring[32]{};
+            const int    count = diag::Snapshot(ring, static_cast<int>(std::size(ring)));
+            r.Text("  LAST EVENTS (seq:event):");
+            for (int i = 0; i < count; ++i) {
+                if (!ring[i].event)
+                    continue;
+                r.Text("\n    ");
+                r.Dec(static_cast<std::uint32_t>(ring[i].seq & 0xffffffffu));
+                r.Text(":");
+                r.Text(diag::Name(ring[i].event));
+                r.Text(" thread ");
+                r.Dec(ring[i].threadId);
+            }
+            r.Line();
+
+            // The switches, read again at crash time rather than remembered from startup. Config is a
+            // function-local static built on first use and never changes, so this cannot allocate.
+            const Config& cfg = Config::Get();
+            r.Text("  SWITCHES: bNoRenderHooks=");
+            r.Dec(cfg.noRenderHooks ? 1 : 0);
+            r.Text(" bNoViewFixup=");
+            r.Dec(cfg.noViewFixup ? 1 : 0);
+            r.Text(" bNoWvpFixup=");
+            r.Dec(cfg.noWvpFixup ? 1 : 0);
+            r.Text(" bNoBlockDraw=");
+            r.Dec(cfg.noBlockDraw ? 1 : 0);
+            r.Text(" bNoVtableSelfCheck=");
+            r.Dec(cfg.noVtableSelfCheck ? 1 : 0);
+            r.Text(" sDisabledHooks=\"");
+            // Named ch, not c: `c` is the CONTEXT* this whole handler works from, and a loop variable that
+            // shadows it inside the same function is the kind of thing that makes the next edit to this
+            // block read the wrong pointer.
+            for (wchar_t ch : cfg.disabledHooks)
+                r.Char(ch < 0x20 || ch > 0x7e ? '?' : static_cast<char>(ch));
+            r.Text("\"");
+            r.Line();
+            r.Text("============================");
+            r.Line();
+        }
         return EXCEPTION_CONTINUE_SEARCH;  // only record; MP2 and our own guards still handle it
     }
 }

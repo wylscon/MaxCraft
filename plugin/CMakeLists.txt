@@ -59,13 +59,32 @@ add_library(MaxCraft SHARED
     src/Mapping.cpp
     src/Render.cpp)
 
+# Which commit this binary came from, so MaxCraft.log's third line names it. Read here rather than
+# hardcoded: an A/B run is meaningless if the .asi in the game folder is a different build, and that
+# has already happened once. Falls back to "unknown" outside a git checkout (a release tarball).
+find_package(Git QUIET)
+set(MCRAFT_GIT_COMMIT "unknown")
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/../.git")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
+        OUTPUT_VARIABLE MCRAFT_GIT_COMMIT_OUT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(MCRAFT_GIT_COMMIT_OUT)
+        set(MCRAFT_GIT_COMMIT "${MCRAFT_GIT_COMMIT_OUT}")
+    endif()
+endif()
+
 target_include_directories(MaxCraft PRIVATE src ${SKYCRAFT_DIR}/protocol)
 target_link_libraries(MaxCraft PRIVATE minhook advapi32)
 target_compile_definitions(MaxCraft PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
     # main.cpp's log banner. The quotes matter: they are what makes this a string literal rather than
     # a bare token, and a generator that passed them unescaped would fail to compile on `0.1.1` rather
     # than log a number. main.cpp keeps a literal fallback so a plain compiler command still works.
-    MCRAFT_VERSION="${PROJECT_VERSION}")
+    MCRAFT_VERSION="${PROJECT_VERSION}"
+    # The commit the same way, for MaxCraft.log's [BUILD] line.
+    MCRAFT_GIT_COMMIT="${MCRAFT_GIT_COMMIT}")
 target_compile_options(MaxCraft PRIVATE /W4 /utf-8 /permissive- /EHsc /wd4324)
 
 # ASI loaders pick up *.asi files from the game folder.

@@ -146,9 +146,20 @@ bool Link::Create()
     if (Valid())
         return true;
 
-    // One caller, on the render thread (Render.cpp's Present, behind its own linkTried flag), so
-    // filling the members below cannot race another Create(). Every other thread reaches the link
-    // only through the published pointers.
+    // Two callers now, not one: the render thread reaches this from Present, and the Minecraft watcher
+    // thread in main.cpp reaches it too, because the shared mapping is what Minecraft opens and a
+    // mapping that only exists when the Present detour installed is a mapping that never exists while
+    // the render path is being diagnosed. They can both arrive here - the watcher creates it a moment
+    // before the game's first frame and Present then asks again - and everything below writes the
+    // members this class publishes, so it has to be one caller at a time. `Valid()` is read outside
+    // the lock on purpose: it is an acquire load of a pointer, and it only ever saves the lock on the
+    // overwhelmingly common path where the link already exists.
+    static std::mutex createGate;
+    std::lock_guard    lock(createGate);
+    if (Valid())
+        return true;  // the other caller won the race while this one waited
+
+    // Every other thread reaches the link only through the pointers published below.
     const std::uint64_t size = proto::kMappingBytes;
     SECURITY_ATTRIBUTES access{ sizeof(access), SharedWithThisUser(), FALSE };
     HANDLE             mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, access.lpSecurityDescriptor ? &access : nullptr, PAGE_READWRITE,

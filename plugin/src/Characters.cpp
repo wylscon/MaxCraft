@@ -3,6 +3,7 @@
 #include "Camera.h"
 #include "Collision.h"
 #include "Config.h"
+#include "Diag.h"
 #include "Hook.h"
 #include "Input.h"
 #include "Log.h"
@@ -60,6 +61,12 @@ namespace
     std::uint32_t g_teleportSeq = 1;
     bool          g_teleportPending = true;
     bool          g_mcWasAlive = false;
+    // The previous value of st.mcInWorld, so the rising edge is logged once instead of every tick.
+    // File scope rather than a static inside the tick, so OnLevelChange can clear it with the rest of
+    // the level state. The camera VALID/INVALID log flags below are reset there for the same reason.
+    bool          g_mcWasInWorld = false;
+    bool          g_loggedValid = false;
+    bool          g_loggedInvalid = false;
     std::uint32_t g_lastMcPid = 0;
     bool          g_haveLastSet = false;
     McPoint       g_lastSet{};
@@ -382,6 +389,10 @@ namespace
         const float delta = g_lastFrameTick ? (std::min)((nowTick - g_lastFrameTick) / 1000.0f, 0.25f) : 0.016f;
         g_lastFrameTick = nowTick;
         st.lastPlayerFrameMs = GetTickCount64();
+        // The game thread's answer to "is a level running", for the thread that starts Minecraft. Set
+        // here, where the fact is established, rather than derived there from `player` and
+        // `lastPlayerFrameMs` (see Runtime.h).
+        st.levelRunning.store(true, std::memory_order_relaxed);
 
         // Minecraft link state.
         const bool mcAlive = link.McAlive();
@@ -403,6 +414,15 @@ namespace
             g_lastMcPid = mcPid;
         g_mcWasAlive = mcAlive;
         st.mcInWorld = st.haveMc && (st.mc.flags & proto::kMcInWorld);
+        // The rising edge only. This is the flag that opens Present's custom-render branch (Render.cpp)
+        // and it is the difference between "the game is drawing" and "the game is drawing plus a state
+        // block, a viewport swap and our own draw calls", so the crash report needs to say whether the
+        // fault landed before or after it went up. Once each way, not per tick.
+        if (st.mcInWorld && !g_mcWasInWorld) {
+            diag::Mark(diag::kWorldReady);
+            mclog::Info("world: Minecraft reports in-world - Present's custom-render branch is open from here");
+        }
+        g_mcWasInWorld = st.mcInWorld;
         const bool screenOpen = st.haveMc && (st.mc.flags & proto::kMcScreenOpen);
         if (screenOpen && !st.mcScreenOpen) {
             st.cursorX = st.viewportW / 2;
@@ -504,6 +524,34 @@ namespace
         if (st.haveMc) {
             Interpolate(st);
             BuildCamera(st);
+        }
+        // Both edges are logged, and each names the term that produced it, because cameraValid is the
+        // gate every part of the render path waits on: the view replacement, the world correction and
+        // the WVP fixup all sit behind it (Render.cpp). It is false for the whole menu and stays
+        // false while nothing is connected on Minecraft's end, so "the crash happened while the
+        // camera was invalid" is a statement about which half of the render path ran - and without
+        // this the log cannot make that distinction at all.
+        //
+        // The reason matters as much as the value: puppet is a five-term AND, and "not valid" is a
+        // different diagnosis depending on which term is false (no shared memory, not in the world,
+        // mapping not calibrated, a takeover, or a teleport Minecraft has not acknowledged). Logged
+        // once each way per level (OnLevelChange clears the flags), not per frame: this runs every
+        // tick and the answer must not become spam.
+        if (puppet != st.cameraValid) {
+            if (puppet && !g_loggedValid) {
+                g_loggedValid = true;
+                diag::Mark(diag::kCameraValid);
+                mclog::Info("camera: now VALID (puppet on) - the view replacement and the WVP fixup can run");
+            } else if (!puppet && !g_loggedInvalid) {
+                g_loggedInvalid = true;
+                diag::Mark(diag::kCameraInvalid);
+                const wchar_t* why = !st.haveMc          ? L"haveMc=0 (no shared memory)"
+                                     : !st.mcInWorld     ? L"mcInWorld=0 (not in the world yet)"
+                                     : !map.Calibrated() ? L"map not calibrated"
+                                     : takeover          ? L"a takeover is running"
+                                                         : L"waiting for Minecraft to acknowledge the teleport";
+                mclog::Info("camera: now INVALID ({}), so the render path is pass-through - block draw, view replacement and WVP fixup are all off", mclog::Utf8(why));
+            }
         }
         st.cameraValid = puppet;
 
@@ -699,6 +747,9 @@ void characters::OnLevelChange()
     st.minecraftOwnsPlayer = false;
     st.gameOwnsInput = true;
     st.cameraValid = false;
+    // The level is gone, so the watcher that starts Minecraft must see it as gone too, or it would
+    // create the shared mapping for a level that is no longer running.
+    st.levelRunning.store(false, std::memory_order_relaxed);
     g_haveLastSet = false;
     g_teleportPending = true;
     // Belongs to the level that just went away, and nothing here may act on it: "Minecraft is still
@@ -717,6 +768,12 @@ void characters::OnLevelChange()
     ++st.levelId;
     collision::Reset(++st.epoch);
     Link::Get().WriteActors(nullptr, 0);
+    // g_mcWasInWorld does NOT stay across a level, unlike the process flags above: it exists only to
+    // catch the rising edge of mcInWorld, and a new level makes that flag go up again legitimately, so
+    // leaving it set would swallow the line for every level after the first.
+    g_mcWasInWorld = false;
+    g_loggedValid = false;
+    g_loggedInvalid = false;
 }
 
 void characters::OnPresent(std::uint32_t width, std::uint32_t height)
