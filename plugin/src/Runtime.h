@@ -34,6 +34,11 @@ struct Runtime
     std::atomic<int> viewportW{ 1280 };
     std::atomic<int> viewportH{ 720 };
 
+    // The player switched to MP2's own controls (Config::gameControlsKey): Minecraft lets go of Max
+    // and MP2 plays as it would without the mod, until the key is pressed again. Set by the input
+    // thread, read by the game thread.
+    std::atomic<bool> gameControls{ false };
+
     // Latest Minecraft state (game thread) and the camera built from it this frame.
     proto::McState mc{};
     bool           haveMc{ false };
@@ -47,6 +52,14 @@ struct Runtime
     std::uint32_t     epoch{ 1 };    // collision epoch: bumps on level change / recalibration
     std::uint32_t     levelId{ 1 };  // SkyState::worldId
     std::uint64_t     lastPlayerFrameMs{ 0 };
+// True while MP2 is actually simulating a level. Set by the game thread, read by the thread that
+// starts Minecraft.
+//
+// This exists instead of that thread reading `player` and `lastPlayerFrameMs` directly, because those
+// are plain members written by the game thread and `lastPlayerFrameMs` is 64 bits wide: a reader on
+// another thread can catch it mid-write. The flag is atomic and carries no such question, and the two
+// members stay exactly as they were for the readers that are on the game thread.
+std::atomic<bool> levelRunning{ false };
 };
 
 Runtime& State();

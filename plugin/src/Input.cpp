@@ -72,6 +72,7 @@ namespace
     // bindings, not MaxCraft's: nothing in MaxCraft.ini may move them.
     constexpr std::uint32_t kGameQuickSave = 0x3F;  // DIK_F5: MP2's quicksave slot
     constexpr std::uint32_t kGameAction    = 0x12;  // DIK_E: MP2's action key (doors, switches)
+    constexpr std::uint32_t kMcInventory   = 0x12;  // DIK_E: Minecraft's inventory key
     constexpr std::uint32_t kDikEscape     = 0x01;
     constexpr std::uint32_t kDikR          = 0x13;  // MP2 reload
     constexpr std::uint32_t kDikO          = 0x18;  // Minecraft's pause / options menu (Esc is MP2's)
@@ -93,6 +94,7 @@ namespace
         kGame,        // MP2 reads it unchanged; MaxCraft holds it back from Minecraft
         kGameAs,      // MP2 reads it as `as` instead of the pressed scan code (our remaps)
         kGameWeapons, // MP2's while weapon mode is on (WeaponKey below)
+        kMinecraftAs, // forwarded to Minecraft as `as` (G -> Minecraft's E); MP2 must not see it
         kConsumed,    // MaxCraft's own: the weapon-mode toggle, B (MP2's right mouse button), O
     };
 
@@ -120,6 +122,7 @@ namespace
     };
     constexpr Row kRows[] = {
         { kDikEscape, Where::kGame, 0 },  // MP2's menu, and the only way out of a level
+        { kGameAction, Where::kGame, 0 }, // MP2's action key (doors, switches); Minecraft's inventory is on iInventoryKey
         { kDikF9, Where::kGame, 0 },      // MP2 quickload
         { kDikO, Where::kConsumed, 0 },   // MP2 has no pause menu that can work while Minecraft drives
                                          // Max, so O opens Minecraft's instead (Esc stays MP2's)
@@ -133,8 +136,10 @@ namespace
         const auto& cfg = Config::Get();
         if (dik == static_cast<std::uint32_t>(cfg.quickSaveKey))
             return { Where::kGameAs, kGameQuickSave };  // F6 -> MP2's F5, because F5 is Minecraft's camera key
-        if (dik == static_cast<std::uint32_t>(cfg.useKey))
-            return { Where::kGameAs, kGameAction };  // G -> MP2's E, because E is Minecraft's inventory key
+        if (dik == static_cast<std::uint32_t>(cfg.inventoryKey))
+            return { Where::kMinecraftAs, kMcInventory };  // G -> Minecraft's E, because E is MP2's action key
+        if (dik == static_cast<std::uint32_t>(cfg.gameControlsKey))
+            return { Where::kConsumed, 0 };
         if (dik == static_cast<std::uint32_t>(cfg.weaponModeKey))
             return { Where::kConsumed, 0 };
         if (dik == static_cast<std::uint32_t>(cfg.bulletTimeKey))
@@ -342,12 +347,38 @@ namespace
         if (g_keyDown[dik] == down)
             return;
         g_keyDown[dik] = down;
+        const auto& cfg = Config::Get();
+        // Checked before Routed(): this key has to work while MP2 has the keyboard too, or the way back
+        // to Minecraft's controls would be the one key that cannot be pressed. Not while a Minecraft
+        // screen is open, so typing the key's character into chat does not switch.
+        if (dik == static_cast<std::uint32_t>(cfg.gameControlsKey) && !State().mcScreenOpen) {
+            // MP2 reads the keyboard both polled and buffered, and the two disagree for a moment about
+            // a held key (the buffer replays the press and release while the poll still says down),
+            // so one press can arrive here as many down edges. Without this the toggle flipped
+            // hundreds of times per press and landed anywhere.
+            static ULONGLONG lastToggle = 0;
+            if (down && GetTickCount64() - lastToggle > 400) {
+                lastToggle = GetTickCount64();
+                const bool on = !State().gameControls.load();
+                State().gameControls = on;
+                input::ReleaseAll();
+                mclog::Info("input: {}", on ? "MP2's own controls (Minecraft lets go of Max)" : "Minecraft's controls again");
+            }
+            return;
+        }
         if (!Routed())
             return;
 
-        auto&       link = Link::Get();
-        const auto& cfg = Config::Get();
-        switch (RouteScan(dik).where) {
+        auto&      link = Link::Get();
+        const auto route = RouteScan(dik);
+        if (route.where == Where::kMinecraftAs) {
+            if (const auto sdl = kDikToSdl[route.as])
+                link.PushInput(proto::kInKey, sdl, down ? 1 : 0);
+            return;
+        }
+        switch (route.where) {
+        case Where::kMinecraftAs:
+            return;  // handled above
         case Where::kConsumed:
             // MaxCraft's own keys: neither Minecraft nor MP2 sees them under their own name.
             if (!down)
@@ -713,8 +744,46 @@ namespace
         return g_gameKeyboardHook ? g_gameKeyboardHook(code, wParam, lParam) : CallNextHookEx(nullptr, code, wParam, lParam);
     }
 
+    // MP2's own low-level keyboard hook, maxpayne2.exe+0x1b70. It swallows the Windows key (and
+    // Ctrl+Esc, Alt combinations), which kills every Win shortcut - Win+Shift+S included - while the
+    // game runs. Detoured so the Windows key, and anything pressed while it is held, goes straight on
+    // to Windows; every other key still reaches MP2's hook unchanged. CrashLog.cpp's startup guard for
+    // the same function keeps working: it matches the faulting instruction further in, which the
+    // detour does not touch.
+    HOOKPROC g_origMp2LowLevelKeyboard = nullptr;
+
+    LRESULT CALLBACK Mp2LowLevelKeyboard(int code, WPARAM wParam, LPARAM lParam)
+    {
+        if (code == HC_ACTION && lParam) {
+            const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+            const bool  winHeld = (g_origGetAsyncKeyState(VK_LWIN) | g_origGetAsyncKeyState(VK_RWIN)) & 0x8000;
+            if (key->vkCode == VK_LWIN || key->vkCode == VK_RWIN || winHeld)
+                return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        return g_origMp2LowLevelKeyboard(code, wParam, lParam);
+    }
+
+    // Once, from the first SetWindowsHookExA MP2 makes: by then its code is decrypted (the Steam
+    // build is encrypted on disk), so the bytes can be checked before anything is patched.
+    void HookMp2LowLevelKeyboard()
+    {
+        static bool tried = false;
+        if (tried)
+            return;
+        tried = true;
+        auto* entry = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr)) + 0x1b70;
+        static constexpr std::uint8_t kEntry[] = { 0x56, 0x57, 0xe8 };  // push esi / push edi / call
+        if (std::memcmp(entry, kEntry, sizeof(kEntry)) != 0) {
+            mclog::Info("input: MP2's low-level keyboard hook is not where this build expects it; Win shortcuts stay blocked");
+            return;
+        }
+        InstallHook(entry, reinterpret_cast<void*>(&Mp2LowLevelKeyboard), g_origMp2LowLevelKeyboard,
+                    "MP2 low-level keyboard hook (Win key passes through)");
+    }
+
     HHOOK WINAPI SetWindowsHookExAHook(int id, HOOKPROC proc, HINSTANCE module, DWORD thread)
     {
+        HookMp2LowLevelKeyboard();
         mclog::Info("input: MP2 installs a Windows hook (type {})", id);
         if ((id == WH_KEYBOARD || id == WH_KEYBOARD_LL) && proc && !g_gameKeyboardHook) {
             g_gameKeyboardHook = proc;
@@ -780,9 +849,9 @@ namespace
     void LogRouting()
     {
         const auto& cfg = Config::Get();
-        mclog::Info("input: routing: MP2 keeps Esc (0x01), F9 (0x43) and 1-9/R in weapon mode; quicksave {} -> MP2's {}, use {} -> MP2's {}, "
-                    "{} toggles weapon mode, {} held is bullet time, O opens Minecraft's pause menu; every other key is Minecraft's",
-                    ScanName(cfg.quickSaveKey), ScanName(kGameQuickSave), ScanName(cfg.useKey), ScanName(kGameAction), ScanName(cfg.weaponModeKey),
+        mclog::Info("input: routing: MP2 keeps Esc (0x01), F9 (0x43) and 1-9/R in weapon mode; quicksave {} -> MP2's {}, E is MP2's action key, inventory {} -> Minecraft's E, "
+                    "{} toggles MP2's own controls, {} toggles weapon mode, {} held is bullet time, O opens Minecraft's pause menu; every other key is Minecraft's",
+                    ScanName(cfg.quickSaveKey), ScanName(kGameQuickSave), ScanName(cfg.inventoryKey), ScanName(cfg.gameControlsKey), ScanName(cfg.weaponModeKey),
                     ScanName(cfg.bulletTimeKey));
     }
 }

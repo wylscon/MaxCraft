@@ -4,6 +4,7 @@
 #include "Characters.h"
 #include "Config.h"
 #include "D3D8.h"
+#include "Diag.h"
 #include "Hook.h"
 #include "Input.h"
 #include "Launcher.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -76,6 +78,19 @@ namespace
     UINT           g_drawsSinceClear = 0;
     UINT           g_drawnAtClear = 0, g_drawnAtEndScene = 0, g_drawnAtPresent = 0;
     EndSceneFn     g_origEndScene = nullptr;
+    // Which BeginScene/EndScene pair of the frame is the WORLD scene. MP2 draws its weapon in a
+    // perspective scene of its own, with the weapon's projection and a depth buffer that holds only the
+    // weapon; "the first perspective scene that reached EndScene" could be that one, and blocks drawn
+    // there take the weapon camera's projection and are not occluded by the level. The world scene is
+    // the frame's busiest perspective scene, measured on the previous frame (the layout does not change
+    // from one frame to the next), and the in-scene moments only draw inside it.
+    constexpr int  kMaxScenes = 64;
+    int            g_sceneIndex = -1;                 // this frame's current scene, from 0
+    UINT           g_sceneDraws[kMaxScenes]{};        // this frame: world draws per perspective scene
+    int            g_worldScene = -1;                 // previous frame's busiest scene; -1 = unknown
+    UINT           g_lastSceneDraws[kMaxScenes]{};    // previous frame, for the log
+    int            g_lastSceneCount = 0;
+    bool InWorldScene() { return g_worldScene < 0 || g_sceneIndex == g_worldScene; }
 
     // MP2's world projection, as it last set it. The blocks are drawn into the same picture, so
     // they take the projection MP2's geometry was drawn with (SceneProjection picks it out of the
@@ -644,7 +659,7 @@ namespace
     Matrix Multiply(const Matrix& a, const Matrix& b);  // defined below, near its row-vector helpers
     void   DrawEntities(void* device, const proto::WorldEntities* entities);  // defined below
     void   CheckSurfaceVtable(void* surface, const char* what, UINT backW, UINT backH, void* device);  // defined below
-    void   CheckTextureVtable();  // defined below
+    void   LogAtlasUploaded();  // defined below
 
     void XformPoint(const float p[3], const Matrix& m, float out[4])
     {
@@ -662,7 +677,7 @@ namespace
             return false;
         // Our blocks live in MP2 world space and our eye is st.camera, so the view is built from it
         // directly. MP2's own view matrices are rotation-only (its scene rides on identity views with
-        // the camera baked into the world matrices — "world matrices moved" in the log), so they
+        // the camera baked into the world matrices â€” "world matrices moved" in the log), so they
         // carry no eye translation and would displace every block off screen. This holds in every
         // BlocksMode: the mode picks when the pass runs, never what it is drawn from, which is why
         // none of them can turn into a weapon-space draw.
@@ -729,7 +744,7 @@ namespace
         SetCommonStates(device);
         const bool untextured = Config::Get().blocksNoTexture;
         VCall<dev::SetTexture>(device, 0u, untextured ? static_cast<void*>(nullptr) : g_atlas);
-        if (untextured) {  // no texture, no alpha test: pure vertex colour — isolates texture problems
+        if (untextured) {  // no texture, no alpha test: pure vertex colour â€” isolates texture problems
             VCall<dev::SetTextureStageState>(device, 0u, UINT(kTssColorOp), DWORD(kTopSelectArg1));
             VCall<dev::SetTextureStageState>(device, 0u, UINT(kTssColorArg1), DWORD(kTaDiffuse));
             VCall<dev::SetTextureStageState>(device, 0u, UINT(kTssAlphaOp), DWORD(kTopSelectArg1));
@@ -1128,6 +1143,7 @@ namespace
 
     HRESULT __stdcall BeginSceneHook(void* device)
     {
+        diag::Mark(diag::kBeginSceneEnter);
         g_sceneHadPerspective = false;
         g_depthClearedThisScene = false;
         g_drawsSinceClear = 0;
@@ -1141,7 +1157,10 @@ namespace
         // A fresh BeginScene is exactly the boundary MP2 sets its projection after.
         g_frameProjCount = 0;
         g_frameSceneDraws = 0;
+        if (!g_ownDraw && g_sceneIndex + 1 < kMaxScenes)
+            ++g_sceneIndex;
         ResetSceneTransformState();
+        diag::Mark(diag::kBeginSceneExit);
         return g_origBeginScene(device);
     }
 
@@ -1186,13 +1205,17 @@ namespace
     // fall through to Present, where the 5 s log's "at present" counter says so.
     HRESULT __stdcall EndSceneHook(void* device)
     {
+        diag::Mark(diag::kEndSceneEnter);
+        if (!g_ownDraw && g_sceneIndex >= 0 && g_sceneHadPerspective)
+            g_sceneDraws[g_sceneIndex] = g_frameSceneDraws;
         const BlocksMode mode = BlocksDrawMode();
-        if (UsesWorldScene(mode) && g_sceneHadPerspective && !g_depthClearedThisScene && ReadyForBlocks()) {
+        if (UsesWorldScene(mode) && g_sceneHadPerspective && !g_depthClearedThisScene && InWorldScene() && ReadyForBlocks()) {
             if (DrawWorldInScene(device)) {
                 g_blocksDrawnThisFrame = true;
                 ++g_drawnAtEndScene;
             }
         }
+        diag::Mark(diag::kEndSceneExit);
         return g_origEndScene(device);
     }
 
@@ -1201,6 +1224,7 @@ namespace
     // its depth is past its world moment and the EndScene hook has to know that.
     HRESULT __stdcall ClearHook(void* device, DWORD count, const void* rects, DWORD flags, DWORD color, float z, DWORD stencil)
     {
+        diag::Mark(diag::kClearEnter);
         constexpr DWORD kClearZBuffer = 2;
         if (flags & kClearZBuffer) {
             // A clear that arrives after MP2 has drawn is it throwing a world away (the weapon / HUD
@@ -1210,45 +1234,57 @@ namespace
                 g_depthClearedThisScene = true;
             g_drawsSinceClear = 0;
         }
-        if ((flags & kClearZBuffer) && UsesWeaponClear(BlocksDrawMode()) && ReadyForBlocks()) {
+        if ((flags & kClearZBuffer) && UsesWeaponClear(BlocksDrawMode()) && InWorldScene() && ReadyForBlocks()) {
             if (DrawWorldInScene(device)) {
                 g_blocksDrawnThisFrame = true;
                 ++g_drawnAtClear;
             }
         }
+        diag::Mark(diag::kClearExit);
         return g_origClear(device, count, rects, flags, color, z, stencil);
     }
 
     HRESULT __stdcall Present(void* device, const RECT* src, const RECT* dst, HWND window, const void* dirty)
     {
+        // §16: the crash report leads with the last event marked, and this callback is the one the
+        // crashing run was inside. Present's markers are deliberately finer than the other hooks'
+        // because it is where the fault landed: the log's own last line is kDepthStencilLogged, 203 ms
+        // before the fault, and the steps after it are the ones that were never reached.
+        diag::Mark(diag::kPresentEnter);
         if (device != g_device) {
             // A new device (first frame, or MP2 recreated it): our resources belonged to the old one.
+            //
+            // ReleaseAll() before g_device is assigned, deliberately: it releases through the recorded
+            // device, which is the old one and is the only handle those objects belong to. Assigning
+            // first would release them through a device they were never created from.
             ReleaseAll();
             g_stateBlock = 0;
+            ResetSceneTransformState();
+            g_haveProj = false;
+            g_haveProjInverse = false;
+            g_blocksDrawnThisFrame = false;
+            g_frameSceneDraws = 0;
+            g_frameProjCount = 0;
+            g_drawsSinceClear = 0;
+            g_depthClearedThisScene = false;
+            g_sceneHadPerspective = false;
+            g_sceneIndex = -1;
+            g_worldScene = -1;
             g_device = device;
         }
-        // Shared memory, once MP2 is up (see main.cpp).
+        // The shared mapping and the Minecraft start-up both used to be right here, which made them depend
+        // on this detour existing. Minecraft is now started and the mapping created by the watcher
+        // thread in main.cpp, off a levelRunning flag, so neither is hostage to the render path - which
+        // is what let this whole investigation run without Minecraft ever connecting.
+        //
+        // Create() is still called from here as well, and is idempotent and mutex-guarded: this is the
+        // better moment for it (the level is genuinely running and MP2's big allocations are behind
+        // us), so it usually wins the race and the watcher just finds it already done.
         static bool linkTried = false;
         if (!linkTried) {
             linkTried = true;
             if (!Link::Get().Create())
-                mclog::Info("no shared memory: Minecraft can't connect this session");
-        }
-        // Minecraft starts once a level is actually running (the player updating), not during MP2's
-        // loading: its boot storm (JVM, disk, the launcher's window) while a level loads crashed MP2
-        // inside its own loader twice now. A 60 s fallback keeps it starting even if the player is
-        // never detected (or the user sits at the menu, which is a safe time too).
-        static bool  minecraftStarted = false;
-        static DWORD firstPresent = 0;
-        if (!minecraftStarted) {
-            if (!firstPresent)
-                firstPresent = GetTickCount();
-            const Runtime& rst = State();
-            const bool     playing = rst.player && GetTickCount64() - rst.lastPlayerFrameMs < 500;
-            if (playing || GetTickCount() - firstPresent > 60000) {
-                minecraftStarted = true;
-                launcher::StartMinecraft();
-            }
+                mclog::Info("shared memory not created on the first frame; the watcher thread will retry");
         }
         if (!g_windowAttached) {
             DeviceCreationParameters params{};
@@ -1306,33 +1342,54 @@ namespace
                     mclog::Info("render: no depth stencil attached");
                     depth = nullptr;
                 }
+                diag::Mark(diag::kDepthStencilLogged);
                 // Both surfaces through both candidate slots, while they are still held: w and h are
                 // this frame's back buffer size, which is the yardstick both descriptions are judged
                 // against. Every one of these reads its own copy of the words, so nothing here
                 // changes what Present does with either surface afterwards.
-                void* checkBuffer = nullptr;
-                if (SUCCEEDED((VCall<dev::GetBackBuffer>(device, 0u, UINT(kBackBufferMono), &checkBuffer))) && checkBuffer) {
-                    CheckSurfaceVtable(checkBuffer, "back buffer", w, h, device);
-                    Release(checkBuffer);
+                //
+                // Only the SDK's GetDesc (slot 8) is called here. It used to call slot 10 as well, as a
+                // "GetDescAlt" - that is IDirect3DSurface8::UnlockRect, and calling it with an extra
+                // argument left the stdcall stack 4 bytes off. bNoVtableSelfCheck=1 skips this block;
+                // the markers around each call say which one was entered.
+                if (!Config::Get().noVtableSelfCheck) {
+                    void* checkBuffer = nullptr;
+                    if (SUCCEEDED((VCall<dev::GetBackBuffer>(device, 0u, UINT(kBackBufferMono), &checkBuffer))) && checkBuffer) {
+                        diag::Mark(diag::kCheckSurfaceBackBuffer);
+                        CheckSurfaceVtable(checkBuffer, "back buffer", w, h, device);
+                        Release(checkBuffer);
+                    }
+                    diag::Mark(diag::kCheckSurfaceDepth);
+                    CheckSurfaceVtable(depth, "depth stencil", w, h, device);
+                    Release(depth);
+                    diag::Mark(diag::kCheckTexture);
+                    LogAtlasUploaded();
+                } else {
+                    mclog::Info("render: d3d8 vtable self-check SKIPPED (bNoVtableSelfCheck=1, diagnostic)");
                 }
-                CheckSurfaceVtable(depth, "depth stencil", w, h, device);
-                Release(depth);
-                CheckTextureVtable();
             }
 
             const Runtime& st = State();
             if (st.mcInWorld) {
+                diag::Mark(diag::kPresentMcInWorld);
                 if (!g_stateBlock)
                     VCall<dev::CreateStateBlock>(device, UINT(kStateBlockAll), &g_stateBlock);
                 if (g_stateBlock)
                     VCall<dev::CaptureStateBlock>(device, g_stateBlock);
+                // Every step of this block is marked, because this is the whole of what MaxCraft draws
+                // and LAST HOOK alone cannot place a fault inside it: there is no marker between the end
+                // of the self-check and PRESENT_EXIT, so a crash anywhere in here reported the same
+                // event whatever had gone wrong. Each of these is one D3D8 call or one draw.
+                diag::Mark(diag::kStateBlockCapture);
                 Viewport saved{};
                 VCall<dev::GetViewport>(device, &saved);
                 const Viewport full{ 0, 0, w, h, 0.0f, 1.0f };
                 VCall<dev::SetViewport>(device, &full);
+                diag::Mark(diag::kSetViewport);
                 // The overlay draws on top whatever the blocks did, so the pass runs even when the
                 // blocks were already in inside MP2's scene; only the block draw is guarded.
                 if (SUCCEEDED((VCall<dev::BeginScene>(device)))) {
+                    diag::Mark(diag::kOurBeginScene);
                     ScenePassGuard pass{ device, saved };
                     Guarded([&] {
                         // The fallback moment: inside MP2's scene the blocks kept the world's depth,
@@ -1340,21 +1397,26 @@ namespace
                         // occlude. It draws only what the scene hooks did not, so no frame ever draws
                         // the blocks twice.
                         if (HaveBlocksCamera(st) && !g_blocksDrawnThisFrame) {
+                            diag::Mark(diag::kDrawWorldEnter2);
                             if (DrawWorld(device, st, w, h)) {
                                 g_blocksDrawnThisFrame = true;
                                 ++g_drawnAtPresent;
                             }
                         }
+                        diag::Mark(diag::kDrawOverlayEnter2);
                         DrawOverlay(device, st, w, h);
                     });
+                    diag::Mark(diag::kOurEndScene);
                     VCall<dev::EndScene>(device);
                 } else {
+                    diag::Mark(diag::kApplyStateBlock);
                     VCall<dev::SetViewport>(device, &saved);
                     if (g_stateBlock)
                         VCall<dev::ApplyStateBlock>(device, g_stateBlock);
                 }
             }
         }
+        diag::Mark(diag::kPresentStatusLog);
         static DWORD lastLog = 0;
         if (GetTickCount() - lastLog > 5000) {
             lastLog = GetTickCount();
@@ -1369,7 +1431,23 @@ namespace
             g_viewSets = g_viewReplaced = g_worldCorrected = g_trianglesDrawn = g_constantsMoved = g_drawFailures = 0;
             g_drawnAtClear = g_drawnAtEndScene = g_drawnAtPresent = g_entityTrianglesDrawn = 0;
             g_rejectedMessages = g_renderBacklog = g_noCamera = 0;
+            std::string layout;
+            for (int i = 0; i < g_lastSceneCount; ++i)
+                layout += std::format("{}{}", i ? " " : "", g_lastSceneDraws[i]);
+            mclog::Info("render: scenes last frame: {} (world draws each: {}); blocks go in scene #{}", g_lastSceneCount, layout.empty() ? "-" : layout,
+                        g_worldScene);
         }
+        // The frame's busiest perspective scene is the world; the next frame's blocks go into it.
+        g_lastSceneCount = (std::min)(g_sceneIndex + 1, kMaxScenes);
+        int busiest = -1;
+        for (int i = 0; i < g_lastSceneCount; ++i) {
+            g_lastSceneDraws[i] = g_sceneDraws[i];
+            if (g_sceneDraws[i] >= 8 && (busiest < 0 || g_sceneDraws[i] > g_sceneDraws[busiest]))
+                busiest = i;
+            g_sceneDraws[i] = 0;
+        }
+        g_worldScene = busiest;
+        g_sceneIndex = -1;
         // The per-frame flags are cleared here, at the one point every frame reaches whether or not
         // anything was drawn: the w/h, mcInWorld and BeginScene branches above all fall through to
         // this, so a frame with no back buffer yet cannot leave the next one thinking it drew blocks.
@@ -1390,17 +1468,14 @@ namespace
         // yet" rather than from the previous frame's leftovers.
         g_haveCorrection = false;
         g_haveProjInverse = false;
+        diag::Mark(diag::kPresentExit);
         return g_origPresent(device, src, dst, window, dirty);
     }
 
-    // ---- D3D8 vtable self-check ----------------------------------------------------------------
-    // D3D8.h hand-declares three things the SDK no longer ships and that do not agree with the
-    // published Direct3D 8 vtables: surf::GetDesc, tex::LockRect/UnlockRect, and SurfaceDesc's field
-    // order. They all work in every captured session, which is exactly why they must not be "fixed"
-    // from the header alone. Once per device, at the two points the log already describes a surface,
-    // each candidate slot is read for real and the sane one is named: which slot fills a
-    // width/height matching the back buffer, and where those two fields actually sit in the struct.
-    // A user reads one session of this instead of trusting the header.
+    // ---- D3D8 surface self-check ---------------------------------------------------------------
+    // Once per device, reads each surface's description raw through surf::GetDesc and says where the
+    // back buffer's width/height landed, so a d3d8.dll or driver that disagrees with D3D8.h shows up
+    // in the log instead of in a crash.
     void CheckSurfaceVtable(void* surface, const char* what, UINT backW, UINT backH, void* device)
     {
         // Once per device per surface, so the back buffer and the depth stencil are each asked once.
@@ -1409,74 +1484,92 @@ namespace
         if (!surface || device == done[slot])
             return;
         done[slot] = device;
-        // Read into words, not into a struct: the two candidate field orders disagree about where
-        // Width and Height are (words 7/8 in D3D8.h's SurfaceDesc, 9/10 in the SDK's), and reading
-        // raw is the only way the log can show which one the runtime actually filled. Poisoned
-        // first, so a slot that is not a description getter at all shows up as untouched words
-        // rather than as zeroes that could be mistaken for a real (zero-sized) description.
-        DWORD       words[12];
+        // Read into words, not into a struct, so the log shows exactly what the runtime filled.
+        // D3D8's D3DSURFACE_DESC is 32 bytes; the 128-byte buffer leaves room for a runtime that
+        // writes more, so a surprise cannot reach /GS's stack cookie.
+        constexpr int kDescWords = 32;
+        DWORD        words[kDescWords];
         for (DWORD& word : words)
             word = 0xDDDDDDDDu;
         const DWORD ourHr = VCall<surf::GetDesc, HRESULT, DWORD*>(surface, words);
-        DWORD       alt[12];
-        for (DWORD& word : alt)
-            word = 0xDDDDDDDDu;
-        const DWORD altHr = VCall<surf::GetDescAlt, HRESULT, DWORD*>(surface, alt);
-        // The back buffer's own size is the yardstick: this file has already trusted it for the
-        // viewport every frame, so a candidate that does not reproduce it did not describe anything.
-        auto        reads = [&](const DWORD* w, bool answered) {
-            const UINT ourW = answered ? w[7] : 0u, ourH = answered ? w[8] : 0u;
-            const UINT sdkW = answered ? w[9] : 0u, sdkH = answered ? w[10] : 0u;
-            if (backW && ourW == backW && ourH == backH)
-                return std::format("{}x{} (D3D8.h's field order)", ourW, ourH);
-            if (backW && sdkW == backW && sdkH == backH)
-                return std::format("{}x{} (the SDK's field order)", sdkW, sdkH);
-            return std::format("{}x{} / SDK order {}x{} - neither is the back buffer", ourW, ourH, sdkW, sdkH);
-        };
-        mclog::Info("render: d3d8 vtable self-check, {} ({}): slot {} read {}, slot {} read {}", what,
-                    backW ? std::format("back buffer is {}x{}", backW, backH) : "no back buffer size", surf::GetDesc,
-                    reads(words, SUCCEEDED(ourHr)), surf::GetDescAlt, reads(alt, SUCCEEDED(altHr)));
-        mclog::Info("render: d3d8 vtable self-check: raw words, {} through slot {}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
-                    "{:08x} {:08x}; through slot {}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} (0xdddddddd = untouched)",
-                    what, surf::GetDesc, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9],
-                    words[10], surf::GetDescAlt, alt[0], alt[1], alt[2], alt[3], alt[4], alt[5], alt[6], alt[7], alt[8], alt[9], alt[10]);
-        mclog::Info("render: d3d8 vtable self-check: the {} keeps slot {} with D3D8.h's SurfaceDesc layout because that is what every captured "
-                    "session read with; if the line above says the SDK's field order is the right one, D3D8.h's SurfaceDesc order is wrong and the "
-                    "'depth stencil {{}}x{{}}' line has been reading Pool and Size",
-                    what, surf::GetDesc);
+        // The back buffer's own size is the yardstick; which pair of words holds it is searched for,
+        // not assumed (D3D8's layout puts Width/Height at words 6/7).
+        std::string where = SUCCEEDED(ourHr) ? std::format("no adjacent pair reads {}x{}", backW, backH) : "slot did not answer";
+        for (int i = 0; SUCCEEDED(ourHr) && backW && i + 1 < kDescWords; ++i) {
+            if (words[i] == backW && words[i + 1] == backH) {
+                where = std::format("{}x{} at words {}/{} - that is the back buffer", backW, backH, i, i + 1);
+                break;
+            }
+        }
+        mclog::Info("render: d3d8 surface self-check, {} ({}): slot {} read {}", what,
+                    backW ? std::format("back buffer is {}x{}", backW, backH) : "no back buffer size", surf::GetDesc, where);
+        mclog::Info("render: d3d8 surface self-check: raw words, {} through slot {}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
+                    "(0xdddddddd = untouched)",
+                    what, surf::GetDesc, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
     }
 
-    // The same question for the atlas: tex::LockRect is 16/17, the SDK's table says 13/14, and both
-    // pairs answered in the sessions where the atlas probe read a plausible texel. Asked once, on one
-    // texel of the atlas so nothing else is disturbed: the pair that locks is the one in use.
-    void CheckTextureVtable()
+    // The texture probe is gone. It locked one texel of the atlas through candidate slots, and the
+    // "alternative" pair (13/14 = GetLevelCount/GetLevelDesc) let GetLevelDesc write a whole surface
+    // description over an 8-byte LockedRect - the crash the log named CHECK_TEXTURE. UploadRgba()
+    // locks the atlas with tex::LockRect (16, the SDK's slot) on every atlas message, so the upload
+    // stays visible through the log line below without a second call site.
+    void LogAtlasUploaded()
     {
         static void* loggedFor = nullptr;
         if (!g_atlas || !g_device || g_device == loggedFor)
             return;
         loggedFor = g_device;
-        RECT       rect{ 0, 0, 1, 1 };
-        LockedRect ours{}, alt{};
-        const bool oursLocked = SUCCEEDED(VCall<tex::LockRect>(g_atlas, 0u, &ours, &rect, DWORD(0))) && ours.pBits != nullptr;
-        if (oursLocked)
-            VCall<tex::UnlockRect>(g_atlas, 0u);
-        const bool altLocked = SUCCEEDED(VCall<tex::LockRectAlt>(g_atlas, 0u, &alt, &rect, DWORD(0))) && alt.pBits != nullptr;
-        if (altLocked)
-            VCall<tex::UnlockRectAlt>(g_atlas, 0u);
-        mclog::Info("render: d3d8 vtable self-check: atlas lock slot {} gave {}, slot {} gave {} (atlas {}x{}, texel read back {:08x} / {:08x}); "
-                    "the pair in use is the one that locked - edit D3D8.h only on the strength of this",
-                    tex::LockRect, oursLocked ? "a texel" : "nothing", tex::LockRectAlt, altLocked ? "a texel" : "nothing", g_atlasW, g_atlasH,
-                    oursLocked ? *reinterpret_cast<const std::uint32_t*>(ours.pBits) : 0u,
-                    altLocked ? *reinterpret_cast<const std::uint32_t*>(alt.pBits) : 0u);
+        mclog::Info("render: atlas {}x{} uploaded through tex::LockRect slot {} ({} bytes of pixels)",
+                    g_atlasW, g_atlasH, tex::LockRect, static_cast<unsigned>(g_atlasW) * g_atlasH * 4u);
     }
 
     HRESULT __stdcall Reset(void* device, PresentParameters* params)
     {
+        diag::Mark(diag::kResetEnter);
+        // Every D3D8 object this mod holds dies with the reset. That is the rule: after
+        // IDirect3DDevice8::Reset the old back buffers, depth stencil and every object created from
+        // the device are invalid, and using one is a use-after-free inside the driver rather than an
+        // error it can report.
+        //
+        // This hook released only the state block and kept the atlas, the overlay texture, every
+        // entity texture and every vertex buffer. The next frame then bound the atlas again - and the
+        // driver read a freed object, followed a vtable pointer out of freed memory, and called through
+        // it: 0xc0000005 at an unreadable address, with the faulting register holding the address it
+        // had just tried to read, three frames down in nvd3dum.dll. LAST HOOK read RESET_EXIT on both
+        // of the runs that produced it, which is the reset itself: the fault lands one frame later,
+        // when the stale pointer is finally used.
+        //
+        // ReleaseAll() is already the one place that knows how to drop all of it, and it is what the
+        // "new device" branch of Present calls. Release before the reset rather than after: a Reset
+        // fails outright if anything still holds a default-pool reference, and a failed Reset leaves
+        // the device in a state the caller cannot recover from.
+        ReleaseAll();
         if (g_stateBlock) {
             VCall<dev::DeleteStateBlock>(device, g_stateBlock);
             g_stateBlock = 0;
         }
-        return g_origReset(device, params);
+        // Everything cached about the old device describes a device that is about to stop existing:
+        // the back buffer size, the scene state and the projection the block pass takes.
+        // ResetSceneTransformState() is the existing home for the scene half of that; the rest is
+        // listed here because there is nowhere else it would be reset.
+        ResetSceneTransformState();
+        g_haveProj = false;
+        g_haveProjInverse = false;
+        g_blocksDrawnThisFrame = false;
+        g_frameSceneDraws = 0;
+        g_frameProjCount = 0;
+        g_drawsSinceClear = 0;
+        g_depthClearedThisScene = false;
+        g_sceneHadPerspective = false;
+        diag::Mark(diag::kResetExit);
+
+        const HRESULT hr = g_origReset(device, params);
+        // A Reset that failed means every pointer above is stale and the device needs recreating, so
+        // this must not be a silent line in a log nobody reads: it is the difference between "the game
+        // limps on" and "the next Present binds a dead texture".
+        if (FAILED(hr))
+            mclog::Info("render: device Reset FAILED ({:08x}); every D3D8 object was released and the device may need recreating", static_cast<unsigned>(hr));
+        return hr;
     }
 
     // Row-vector 4x4 helpers for rigid transforms.
@@ -1516,8 +1609,10 @@ namespace
 
     HRESULT __stdcall SetRenderState(void* device, UINT state, DWORD value)
     {
+        diag::Mark(diag::kSetRenderStateEnter);
         if (!g_ownDraw && state == kRsZEnable && g_perspectiveActive && value)
             g_sceneZEnable = value;
+        diag::Mark(diag::kSetRenderStateExit);
         return g_origSetRenderState(device, state, value);
     }
 
@@ -1617,7 +1712,23 @@ namespace
         // count * 16 bytes. buffer holds 96 * 4 floats = 96 registers exactly, so the bound has to be
         // on the register count, not on bytes. Nothing here reads past data: every access is inside
         // the first `count` registers, and the loop only ever touches offsets where i + 4 <= count.
-        if (g_ownDraw || !data || count < 4 || count > 96 || !st.cameraValid || !g_haveCorrection || !g_haveProjInverse)
+                diag::Mark(diag::kSetVsConstantEnter);
+        // A switch whose own log line sits behind a guard cannot be verified from the log. The WVP
+        // "DISABLED" line used to print from *after* the early return below, so a run that never
+        // reached it produced no line at all - and "the fixup was off" then looks exactly like "the
+        // fixup was never in play", which are very different answers. One line before the return,
+        // naming every term of the guard, settles it: cameraValid 0 means the fixup cannot have run
+        // at all, whatever the ini says.
+        static bool g_wvpGuardLogged = false;
+        if (!g_wvpGuardLogged) {
+            g_wvpGuardLogged = true;
+            mclog::Info("render: WVP ENTER reg={} count={} data={} ownDraw={} cameraValid={} haveCorrection={} haveProjInverse={} -> the fixup is {} this call",
+                        reg, count, data ? 1 : 0, g_ownDraw ? 1 : 0, st.cameraValid ? 1 : 0, g_haveCorrection ? 1 : 0,
+                        g_haveProjInverse ? 1 : 0,
+                        (g_ownDraw || !data || count < 4 || count > 96 || !st.cameraValid || !g_haveCorrection || !g_haveProjInverse)
+                            ? "NOT applied by"
+                            : "applied by");
+        }        if (g_ownDraw || !data || count < 4 || count > 96 || !st.cameraValid || !g_haveCorrection || !g_haveProjInverse)
             return g_origSetVsConstant(device, reg, data, count);
         // TEMPORARY DIAGNOSTIC: the WVP fixup is disabled to isolate whether the menu-to-3D crash is
         // this path or the transform replacement. When set to 1 the call passes straight through.
@@ -1672,6 +1783,21 @@ namespace
 
     HRESULT __stdcall SetTransform(void* device, UINT state, const Matrix* matrix)
     {
+        // The render path's own checkpoint, once, at the last moment before anything of ours can run.
+        //
+        // Without it a crash inside the render path is silent. That is not hypothetical: the run that
+        // ruled the WVP fixup out came back with a log that stopped four seconds before the fault, so we
+        // could not even prove whether the camera had ever become valid - and cameraValid is what every
+        // replacement below waits for (Characters.cpp sets it from the Minecraft side's teleport ack,
+        // so it stays false through the menu and stays false if nothing is connected on the other end).
+        // One line here closes that gap: if this prints, the crash was after SetTransform was reached;
+        // if it does not, the crash was before it and the hooks above are the place to look.
+        static bool g_entered = false;
+        if (!g_entered) {
+            g_entered = true;
+            mclog::Info("render: SetTransform reached (state={} cameraValid={} mcInWorld={})", static_cast<int>(state),
+                        State().cameraValid ? 1 : 0, State().mcInWorld ? 1 : 0);
+        }
         if (g_ownDraw || !matrix)
             return g_origSetTransform(device, state, matrix);
 
@@ -1756,22 +1882,220 @@ namespace
     Create8Fn      g_origCreate8 = nullptr;
     CreateDeviceFn g_origCreateDevice = nullptr;
     bool           g_deviceHooked = false;
+    HMODULE        g_d3d8Module = nullptr;  // for the "is this slot really d3d8?" check on every install
+
+    // ---- the eight D3D8 device hooks, in one table -------------------------------------------------
+    //
+    // One row per hook, and the install loop below reads it: the name in the log, the number in
+    // sDisabledHooks and the vtable index all come from here, so they cannot drift apart. bNoRenderHooks
+    // turns all eight on at once, which is a single bit of information - it says "the render path", not
+    // which callback. Naming them is what turns that into an answer.
+    struct HookSpec
+    {
+        const char* name;
+        int         index;
+    };
+    constexpr HookSpec kDeviceHooks[] = {
+        { "Present", dev::Present },
+        { "Reset", dev::Reset },
+        { "BeginScene", dev::BeginScene },
+        { "EndScene", dev::EndScene },
+        { "Clear", dev::Clear },
+        { "SetTransform", dev::SetTransform },
+        { "SetRenderState", dev::SetRenderState },
+        { "SetVertexShaderConstant", dev::SetVertexShaderConstant },
+    };
+
+    // Case-insensitive search for `name` in the comma-separated sDisabledHooks list. A name in the ini
+    // that is not in the table above is reported once, because a typo'd name that silently disables
+    // nothing would make an A/B run look like the hook was cleared.
+    bool HookDisabled(const char* name)
+    {
+        const std::wstring& list = Config::Get().disabledHooks;
+        if (list.empty())
+            return false;
+        std::wstring        wanted;
+        for (const char* c = name; *c; ++c)
+            wanted.push_back(static_cast<wchar_t>(*c));
+        std::wstring        item;
+        item.reserve(list.size());
+        auto                match = [](const std::wstring& a, const std::wstring& b) {
+            if (a.size() != b.size())
+                return false;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                if (towlower(a[i]) != towlower(b[i]))
+                    return false;
+            }
+            return true;
+        };
+        for (std::size_t i = 0; i <= list.size(); ++i) {
+            const wchar_t c = (i < list.size()) ? list[i] : L',';
+            if (c == L',') {
+                std::wstring trimmed = item;
+                while (!trimmed.empty() && iswspace(trimmed.front()))
+                    trimmed.erase(trimmed.begin());
+                while (!trimmed.empty() && iswspace(trimmed.back()))
+                    trimmed.pop_back();
+                if (!trimmed.empty() && match(trimmed, wanted))
+                    return true;
+                item.clear();
+            } else {
+                item.push_back(c);
+            }
+        }
+        return false;
+    }
+
+    // Once, so a name in sDisabledHooks that no hook answers to is visible instead of silent.
+    void ReportUnknownHookNames()
+    {
+        const std::wstring& list = Config::Get().disabledHooks;
+        if (list.empty())
+            return;
+        std::wstring item;
+        auto        known = [&](const std::wstring& n) {
+            for (const HookSpec& h : kDeviceHooks) {
+                std::wstring hn;
+                for (const char* c = h.name; *c; ++c)
+                    hn.push_back(static_cast<wchar_t>(*c));
+                if (hn.size() == n.size()) {
+                    std::size_t i = 0;
+                    for (; i < n.size(); ++i) {
+                        if (towlower(n[i]) != towlower(hn[i]))
+                            break;
+                    }
+                    if (i == n.size())
+                        return true;
+                }
+            }
+            return false;
+        };
+        for (std::size_t i = 0; i <= list.size(); ++i) {
+            const wchar_t c = (i < list.size()) ? list[i] : L',';
+            if (c == L',') {
+                std::wstring trimmed = item;
+                while (!trimmed.empty() && iswspace(trimmed.front()))
+                    trimmed.erase(trimmed.begin());
+                while (!trimmed.empty() && iswspace(trimmed.back()))
+                    trimmed.pop_back();
+                if (!trimmed.empty() && !known(trimmed))
+                    mclog::Info("sDisabledHooks: '{}' names no D3D8 device hook, so it disabled nothing", mclog::Utf8(trimmed));
+                item.clear();
+            } else {
+                item.push_back(c);
+            }
+        }
+    }
+
+    // Install one device hook, and say enough about it that a wrong slot is visible in the log instead
+    // of only showing up as a crash three seconds later.
+    //
+    // `skipped` is separate from the return value on purpose. Both a hook that installed and a hook the
+    // user asked us not to install are "not a failure", and conflating them made the summary report
+    // "-7 device hooks did not install" for a run where seven were switched off on purpose and the one
+    // that was asked for installed fine. A run's whole meaning is in that line, so it has to be right.
+    //
+    // The checks are the point. A correct index is not the same as a correct target: if the slot does
+    // not hold an executable address then the index is not the method we think it is, and everything
+    // built on top of it - the trampoline, the arguments, the call's own stack - is already wrong.
+    // That is checked here, once, while we can still read the log.
+    template <class T>
+    bool InstallDeviceHook(void* device, const HookSpec& spec, void* detour, T& original, bool& skipped)
+    {
+        skipped = false;
+        mclog::Info("[HOOK] BEGIN name={} vtable={}", spec.name, spec.index);
+        if (HookDisabled(spec.name)) {
+            skipped = true;
+            mclog::Info("[HOOK] SKIP name={} vtable={} (listed in sDisabledHooks)", spec.name, spec.index);
+            return true;
+        }
+        void* target = VSlot(device, spec.index);
+        if (!target) {
+            mclog::Info("[HOOK] FAIL name={} vtable={}: slot is null", spec.name, spec.index);
+            return false;
+        }
+        if (!diag::IsExecutable(target)) {
+            mclog::Info("[HOOK] FAIL name={} vtable={}: slot {:p} is not executable, so it is not a function", spec.name, spec.index, target);
+            return false;
+        }
+        // Where the slot really points, by name. This is a log line rather than a test because the
+        // answer is not a given: it says whether the device is the plain d3d8 one or something the game
+        // substituted, and only the log can settle that. A slot in the wrong module is still reported
+        // (as a warning) but not refused - refusing it would leave the game with no hooks at all and
+        // make the next run's "no crash" mean nothing.
+        char where[128];
+        diag::DescribeAddress(target, where, sizeof(where));
+        const bool  inD3d8 = diag::ModuleOf(target) == g_d3d8Module;
+        if (!inD3d8)
+            mclog::Info("[HOOK] WARN name={} vtable={}: slot is {}, not d3d8.dll ({})", spec.name, spec.index, where,
+                        g_d3d8Module ? "in another module" : "unknown - d3d8.dll was never resolved");
+        if (!InstallHook(target, detour, original, spec.name))
+            return false;
+        mclog::Info("[HOOK] OK name={} vtable={} original={} replacement={:p}", spec.name, spec.index, where, detour);
+        return true;
+    }
 
     HRESULT __stdcall CreateDevice(void* d3d, UINT adapter, UINT type, HWND window, DWORD flags, PresentParameters* params, void** out)
     {
         const HRESULT hr = g_origCreateDevice(d3d, adapter, type, window, flags, params, out);
+        // Say why not, once. A run whose log shows "hooked IDirect3D8::CreateDevice" and then no [HOOK]
+        // lines at all has told us nothing: this branch is the difference between "no device yet" (the
+        // game will ask again) and "the game asked and we declined" (it will not), and those look
+        // identical from the log without this line.
+        static bool g_declinedLogged = false;
+        if (SUCCEEDED(hr) && (!out || !*out || g_deviceHooked)) {
+            if (!g_declinedLogged) {
+                g_declinedLogged = true;
+                mclog::Info("render: CreateDevice returned {}, {} - no device hooks installed on this call",
+                            static_cast<long>(hr), !out ? "no out pointer" : (!*out ? "out pointer was null" : "already hooked"));
+            }
+        }
         if (SUCCEEDED(hr) && out && *out && !g_deviceHooked) {
             g_deviceHooked = true;
             void* device = *out;
-            InstallHook(VSlot(device, dev::Present), reinterpret_cast<void*>(&Present), g_origPresent, "IDirect3DDevice8::Present");
-            InstallHook(VSlot(device, dev::Reset), reinterpret_cast<void*>(&Reset), g_origReset, "IDirect3DDevice8::Reset");
-            InstallHook(VSlot(device, dev::BeginScene), reinterpret_cast<void*>(&BeginSceneHook), g_origBeginScene, "IDirect3DDevice8::BeginScene");
-            InstallHook(VSlot(device, dev::EndScene), reinterpret_cast<void*>(&EndSceneHook), g_origEndScene, "IDirect3DDevice8::EndScene");
-            InstallHook(VSlot(device, dev::Clear), reinterpret_cast<void*>(&ClearHook), g_origClear, "IDirect3DDevice8::Clear");
-            InstallHook(VSlot(device, dev::SetTransform), reinterpret_cast<void*>(&SetTransform), g_origSetTransform, "IDirect3DDevice8::SetTransform");
-            InstallHook(VSlot(device, dev::SetRenderState), reinterpret_cast<void*>(&SetRenderState), g_origSetRenderState, "IDirect3DDevice8::SetRenderState");
-            InstallHook(VSlot(device, dev::SetVertexShaderConstant), reinterpret_cast<void*>(&SetVertexShaderConstant), g_origSetVsConstant,
-                        "IDirect3DDevice8::SetVertexShaderConstant");
+            diag::Mark(diag::kDeviceCreated);
+            g_d3d8Module = GetModuleHandleW(L"d3d8.dll");
+            ReportUnknownHookNames();
+            int wanted = 0, installedOk = 0, skippedCount = 0;
+            bool hookSkipped = false;
+#define INSTALL_ONE(N, FN, PTR)                                                                                        \
+    do {                                                                                                               \
+        hookSkipped = false;                                                                                           \
+        if (!HookDisabled(kDeviceHooks[N].name))                                                                       \
+            ++wanted;                                                                                                  \
+        if (InstallDeviceHook(device, kDeviceHooks[N], reinterpret_cast<void*>(&FN), PTR, hookSkipped))                 \
+            ++installedOk;                                                                                             \
+        if (hookSkipped)                                                                                               \
+            ++skippedCount;                                                                                            \
+    } while (false)
+            INSTALL_ONE(0, Present, g_origPresent);
+            INSTALL_ONE(1, Reset, g_origReset);
+            INSTALL_ONE(2, BeginSceneHook, g_origBeginScene);
+            INSTALL_ONE(3, EndSceneHook, g_origEndScene);
+            INSTALL_ONE(4, ClearHook, g_origClear);
+            INSTALL_ONE(5, SetTransform, g_origSetTransform);
+            INSTALL_ONE(6, SetRenderState, g_origSetRenderState);
+            INSTALL_ONE(7, SetVertexShaderConstant, g_origSetVsConstant);
+#undef INSTALL_ONE
+            const int failed = wanted - (installedOk - skippedCount);
+            // From here the game is drawing through our hooks and the log must be able to show it. The
+            // line names the vtable slots the way the game calls them, because a wrong index here does
+            // not fail at install time - it hands the game a detour that runs in place of something else
+            // entirely, which is exactly the kind of thing that ends in "unknown module, 0x001aface".
+            //
+            // A/B runs are only about the hooks that are actually in place, so the count has to be said out loud:
+            // "EndScene only" has to be able to prove that the other seven are off by choice rather
+            // than because their slot failed its check. `wanted` is what the config asked for,
+            // `skippedCount` what it deliberately left out, `failed` what it wanted and did not get.
+            mclog::Info("render: device hooks: {} active ({} skipped by sDisabledHooks, {} failed their target check), of {} in the table",
+                        wanted - failed, skippedCount, failed, static_cast<int>(std::size(kDeviceHooks)));
+            if (failed)
+                mclog::Info("render: {} device hook(s) did not install - see the [HOOK] FAIL lines above. Fewer hooks are active than the switch above asks for, so this run tests something narrower than it looks.", failed);
+            const Config& cfg = Config::Get();
+            mclog::Info("render: block draw {} (bNoBlockDraw={}), view fixup {} (bNoViewFixup={}), WVP fixup {} (bNoWvpFixup={}), vtable self-check {} (bNoVtableSelfCheck={})",
+                        cfg.noBlockDraw ? "OFF" : "on", cfg.noBlockDraw ? 1 : 0, cfg.noViewFixup ? "OFF" : "on", cfg.noViewFixup ? 1 : 0,
+                        cfg.noWvpFixup ? "OFF" : "on", cfg.noWvpFixup ? 1 : 0, cfg.noVtableSelfCheck ? "OFF" : "on",
+                        cfg.noVtableSelfCheck ? 1 : 0);
         }
         return hr;
     }
@@ -1787,6 +2111,20 @@ namespace
 
 bool render::Install()
 {
+    // Say what the diagnostic switches actually resolved to, once, before anything is installed.
+    //
+    // This is not tidiness. A switch whose own log line sits behind a runtime guard is a switch we
+    // cannot verify: bNoWvpFixup's line only prints from inside SetVertexShaderConstant, past the early
+    // return on cameraValid, so a run that ends with no line has not shown us whether the fixup was
+    // ever reached - only that the crash came anyway. Reading all four values out loud at startup
+    // makes every A/B run self-verifying: if the line says 1 and the game still crashed, the switch is
+    // ruled out, and if it says 0 the ini was not read and the run proves nothing at all.
+    {
+        const Config& c = Config::Get();
+        mclog::Info("diagnostic: bNoRenderHooks={} bNoViewFixup={} bNoWvpFixup={} bNoBlockDraw={} bNoVtableSelfCheck={} bDiagnostics={} sDisabledHooks=\"{}\"",
+                    c.noRenderHooks ? 1 : 0, c.noViewFixup ? 1 : 0, c.noWvpFixup ? 1 : 0, c.noBlockDraw ? 1 : 0,
+                    c.noVtableSelfCheck ? 1 : 0, c.diagnostics ? 1 : 0, mclog::Utf8(c.disabledHooks));
+    }
     // TEMPORARY DIAGNOSTIC: bNoRenderHooks=1 installs no D3D8 hook at all. The mod then runs with
     // movement, collision and combat but draws nothing of Minecraft's: no blocks, no hand, no
     // overlay. Windows logs the menu-to-3D crash as "unknown module, 0x001aface" with no EXCEPTION
@@ -1799,6 +2137,10 @@ bool render::Install()
         return true;
     }
     HMODULE d3d8 = LoadLibraryW(L"d3d8.dll");
+    // Kept so the per-hook install can ask "is this vtable slot really inside d3d8.dll?". The handle is
+    // already ours (LoadLibrary above raised the count) and CreateDevice runs long after this returns.
+    if (d3d8)
+        g_d3d8Module = d3d8;
     void*   create = d3d8 ? reinterpret_cast<void*>(GetProcAddress(d3d8, "Direct3DCreate8")) : nullptr;
     if (!create) {
         mclog::Info("render: Direct3DCreate8 not found");

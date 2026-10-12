@@ -32,9 +32,20 @@ struct Config
     int bulletTimeKey = 0x30;  // DIK_B: held -> MP2's bullet time (right mouse button)
     int quickSaveKey = 0x40;   // DIK_F6: -> MP2's quicksave (F5, which is Minecraft's camera key)
     int weaponModeKey = 0x2F;  // DIK_V: toggles MP2 weapon mode (mouse buttons, wheel, 1-9 and R go to MP2's guns)
-    int useKey = 0x22;         // DIK_G: MP2 receives it as E (its action key: doors, switches); E is Minecraft's inventory
+    int inventoryKey = 0x22;     // DIK_G: Minecraft receives it as E (its inventory); E itself is MP2's action key
+    int gameControlsKey = 0x42;  // DIK_F8: toggles MP2's own controls (Minecraft lets go of Max until pressed again)
 
     // [Debug]
+    // Names of the D3D8 device hooks to skip installing, comma separated: "Present,EndScene".
+    //
+    // One switch per hook would be eight booleans in the ini and eight places in Render.cpp that have
+    // to agree with the real hook list; a name list is checked against the same table the install
+    // uses, so a name that does not exist is reported instead of silently doing nothing. What it buys
+    // is the A/B this diagnosis needs: "bNoRenderHooks=0" turns on all eight at once.
+    std::wstring disabledHooks;
+    // Skips the once-per-device D3D8 surface self-check in Present (CheckSurfaceVtable), which reads
+    // the back buffer's and depth stencil's descriptions raw through surf::GetDesc.
+    bool noVtableSelfCheck = false;
     bool diagnostics = false;
     bool blocksNoDepth = false;    // draw Minecraft's blocks over everything
     bool blocksNoTexture = false;  // draw them untextured (vertex colour only): texture or transform?

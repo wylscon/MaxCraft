@@ -96,6 +96,11 @@ namespace
     }
 }
 
+bool launcher::MinecraftUp()
+{
+    return MinecraftRunning();
+}
+
 void launcher::StartMinecraft()
 {
     const auto& cfg = Config::Get();
