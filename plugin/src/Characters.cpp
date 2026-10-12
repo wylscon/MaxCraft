@@ -80,6 +80,18 @@ namespace
     // him out there) and Minecraft is put back next to him, still looking where it looked.
     bool          g_outsideLevel = false;
     DWORD         g_lastBorderTeleport = 0;
+    // Where Max stood over the last few seconds while Minecraft had him, oldest first, one entry per
+    // 100 ms. Minecraft's collision does not have every one of MP2's walls (doors and other moving
+    // objects are missing), so Max can be walked through one into space MP2 has no room for - and MP2
+    // kills him there. When that happens he is revived and put back where he stood a moment earlier.
+    struct SafeSpot
+    {
+        McPoint at;
+        DWORD   tick;
+    };
+    std::vector<SafeSpot> g_safeTrail;
+    DWORD                 g_reviveWindowStart = 0;
+    int                   g_revivesInWindow = 0;
     bool          g_keepLook = false;
     bool          g_playerByCamera = false;  // found through MP2's camera target
     DWORD         g_lastStatusLog = 0;
@@ -380,6 +392,8 @@ namespace
         st.eyeZ = st.feetZ;
     }
 
+    bool ReviveMax(X_Character* player);  // defined below, beside ApplyPuppet
+
     // Once per game frame, from the player's own update.
     void PerFrame(X_Character* player)
     {
@@ -450,6 +464,10 @@ namespace
             cinematic = api.isInCinematicMode(player);
             dead = api.isCharacterDead(player);
         });
+        // Dead while Minecraft had him and Minecraft's player is alive: MP2 killed him for standing
+        // outside its walls, not Minecraft. Undo it rather than handing him to MP2's death sequence.
+        if (dead && !cinematic && st.minecraftOwnsPlayer && !(st.haveMc && (st.mc.flags & proto::kMcDead)) && ReviveMax(player))
+            dead = false;
         const bool takeover = cinematic || camera::PathActive() || dead;
         if (takeover != g_takeover) {
             if (takeover)
@@ -570,6 +588,23 @@ namespace
             collision::Update(puppet ? McPoint{ st.mc.x, st.mc.y, st.mc.z } : g_playerMc);
     }
 
+    // Max's feet at a Minecraft position, facing Minecraft's yaw.
+    void PlaceMax(X_Character* player, const McPoint& at)
+    {
+        auto&           st = State();
+        auto&           map = Mapping::Get();
+        const auto&     cfg = Config::Get();
+        Matrix4x3       m{};
+        map.FacingYaw(st.yaw, cfg.forwardRow, m);
+        const mp2::Vec3 up = map.DirToMp2(0, 1, 0);
+        const mp2::Vec3 feet = map.ToMp2(at.x, at.y, at.z);
+        m.row[3] = { feet.x + up.x * cfg.feetOffset, feet.y + up.y * cfg.feetOffset, feet.z + up.z * cfg.feetOffset };
+        Guarded([&] { api.setTransform(api.accessCharacterProperties(player), m); });
+        MovePhantom(RigidBodyOf(player), m);
+        g_lastSet = at;
+        g_haveLastSet = true;
+    }
+
     // Minecraft's feet -> Max, after MP2's own physics (which we skipped) so nothing overrides it.
     void ApplyPuppet(X_Character* player)
     {
@@ -577,12 +612,8 @@ namespace
             g_outsideLevel = true;
             return;
         }
-        auto&            st = State();
-        auto&            map = Mapping::Get();
-        const auto&      cfg = Config::Get();
-        Matrix4x3        m{};
-        map.FacingYaw(st.yaw, cfg.forwardRow, m);
-        const mp2::Vec3 up = map.DirToMp2(0, 1, 0);
+        auto&       st = State();
+        const auto& cfg = Config::Get();
         // First person: the camera sits inside Max's head, so his body steps back out of view.
         // MP2 still has him right next to the player (enemies see and shoot him there).
         double fx = st.feetX, fz = st.feetZ;
@@ -591,12 +622,71 @@ namespace
             fx += std::sin(yaw) * cfg.bodyBehind;
             fz -= std::cos(yaw) * cfg.bodyBehind;
         }
-        const mp2::Vec3 feet = map.ToMp2(fx, st.feetY, fz);
-        m.row[3] = { feet.x + up.x * cfg.feetOffset, feet.y + up.y * cfg.feetOffset, feet.z + up.z * cfg.feetOffset };
-        Guarded([&] { api.setTransform(api.accessCharacterProperties(player), m); });
-        MovePhantom(RigidBodyOf(player), m);
-        g_lastSet = { fx, st.feetY, fz };
-        g_haveLastSet = true;
+        PlaceMax(player, { fx, st.feetY, fz });
+
+        const DWORD now = GetTickCount();
+        if (g_safeTrail.empty() || now - g_safeTrail.back().tick >= 100) {
+            if (g_safeTrail.size() >= 40)
+                g_safeTrail.erase(g_safeTrail.begin());
+            g_safeTrail.push_back({ g_lastSet, now });
+        }
+    }
+
+    // MP2 killed Max while Minecraft had him and Minecraft's player is alive. Every known way MP2 kills
+    // him outright is already refused (SetHealth/SetCharacterDead/SetDying below), yet stepping outside
+    // MP2's walls still leaves him dead, so the state is undone after the fact: dying and dead cleared,
+    // health back if it reached zero, Max put back where he stood 3/4 s earlier and Minecraft's player
+    // teleported to him. Limited to five in five seconds so a spot MP2 keeps killing him in ends in
+    // MP2's own death rather than in a loop.
+    bool ReviveMax(X_Character* player)
+    {
+        const DWORD now = GetTickCount();
+        if (now - g_reviveWindowStart > 5000) {
+            g_reviveWindowStart = now;
+            g_revivesInWindow = 0;
+        }
+        if (++g_revivesInWindow > 5) {
+            if (g_revivesInWindow == 6)
+                mclog::Info("MP2 keeps killing Max here; letting it (5 revivals in 5 s)");
+            return false;
+        }
+
+        X_CharacterProperties* props = nullptr;
+        float                  health = 0.0f, max = 100.0f;
+        Guarded([&] {
+            props = api.accessCharacterProperties(player);
+            health = api.getHealth(player);
+            max = api.getMaximumHealth(player);
+        });
+        if (!props)
+            return false;
+        Guarded([&] { g_origSetDying(props, false); });
+        Guarded([&] { g_origSetDead(player, false); });
+        if (!(health > 0.0f) && max > 0.0f)
+            Guarded([&] { g_origSetHealth(props, max); });
+
+        // The newest spot at least 750 ms old: the last few were the steps that took him out.
+        const SafeSpot* spot = nullptr;
+        for (const SafeSpot& s : g_safeTrail)
+            if (now - s.tick >= 750)
+                spot = &s;
+        if (!spot && !g_safeTrail.empty())
+            spot = &g_safeTrail.front();
+        McPoint back{};
+        if (spot) {
+            back = spot->at;
+            g_safeTrail.erase(g_safeTrail.begin() + (spot - g_safeTrail.data()) + 1, g_safeTrail.end());
+            PlaceMax(player, back);
+        }
+
+        bool still = true;
+        Guarded([&] { still = api.isCharacterDead(player); });
+        g_teleportPending = true;  // Minecraft's player follows Max back
+        g_keepLook = true;
+        g_haveLastSet = false;
+        mclog::Info("MP2 killed Max outside its walls (hp {:.0f}/{:.0f}); revival {}, {}", health, max, still ? "FAILED (still dead)" : "ok",
+                    spot ? std::format("put back at ({:.1f}, {:.1f}, {:.1f})", back.x, back.y, back.z) : std::string("no earlier spot to put him back at"));
+        return !still;
     }
 
     void __fastcall UpdatePrePhysics(X_Character* self, void*, const X_TimeUpdate& time)
@@ -684,9 +774,11 @@ namespace
 
     void LogRefused(const char* what)
     {
-        static DWORD last = 0;
-        if (GetTickCount() - last > 2000) {
-            last = GetTickCount();
+        // Per kind, so a refused "damage" does not hide the "death" or "dying" refused right after it.
+        static std::unordered_map<const char*, DWORD> last;
+        DWORD& when = last[what];
+        if (GetTickCount() - when > 2000) {
+            when = GetTickCount();
             mclog::Info("refused MP2 {} for Max (Minecraft decides his health)", what);
         }
     }
@@ -760,6 +852,7 @@ void characters::OnLevelChange()
     g_outsideLevel = false;
     g_lastBorderTeleport = 0;
     g_keepLook = false;
+    g_safeTrail.clear();  // spots in the level that went away
     // g_teleportSeq stays: Minecraft matches SkyState::teleportSeq against the last one it applied,
     // so it has to keep climbing across levels. g_nextId stays for the same reason (ids are handed to
     // Minecraft and remembered there). g_lastMcPid and g_mcWasAlive stay: they track the Minecraft
